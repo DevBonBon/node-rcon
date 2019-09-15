@@ -3,138 +3,114 @@ const EventEmitter = require('events');
 
 const Packet = require('./Packet.js');
 /**
- * Used to create and send commands through a console using the RCON protocol
+ * Used to connect and send commands to a console through the RCON protocol
  */
-module.exports = class RCON {
+class Rcon {
   /**
-   * @param {Number} [timeout=3000] Timeout for connections and responses
+   * @param {Number} [timeout=1000] Timeout for connections and responses
    */
-  constructor (timeout = 3000) {
+  constructor (timeout = 1000) {
     this.timeout = timeout;
+    this.events = new EventEmitter();
+    this.reset();
+  }
+
+  /**
+   * Resets the internal state
+   */
+  reset () {
     this.online = false;
     this.authenticated = false;
-    this.queue = {
-      drained: true,
-      sending: [],
-      pending: {}
-    };
-    this.events = new EventEmitter()
-      .on('removeListener', (id, listener) => {
-        clearTimeout(this.queue.pending[id].timer);
-        delete this.queue.pending[id];
-      })
-      .on('newListener', (id, listener) => {
-        this.queue.pending[id] = {
-          timer: setTimeout(() => {
-            this.events.emit(id, new Error(`Packet timed out!`));
-            this.events.off(id, listener);
-          }, this.timeout),
-          payloads: []
-        };
-      });
+    this.queue = [];
+    this.queue.drained = true;
   }
-  /**
-   * Ends the connection, but doesn't destroy it
-   */
-  end () {
-    this.socket.end();
-  }
+
   /**
    * Immediately sends out as many queued packets as possible
    */
   drain () {
-    while (this.queue.drained && this.queue.sending.length > 0) {
-      this.queue.drained = this.socket.write(this.queue.sending.shift());
+    while (this.queue.drained && this.queue.length > 0) {
+      this.queue.drained = this.socket.write(this.queue.shift());
     }
   }
+
+  /**
+   * Send a packet with given payload through the socket
+   * @param  {String} payload Data to encode into the packet
+   * @param  {Number} [type=Packet.type.COMMAND] Type of packet to send
+   * @return {Promise} Resolves to response or rejects with an Error object
+   */
+  send (payload, type = Packet.type.COMMAND, id = Packet.id()) {
+    return Promise.race([
+      new Promise(resolve => setTimeout(resolve, this.timeout, new Error('Packet timed out!'))),
+      new Promise(resolve => {
+        this.queue.push(Packet.write(id, type, payload));
+        this.queue.push(Packet.write(id, Packet.type.END, ''));
+        this.drain();
+        this.events.once(id, resolve);
+      })
+    ]).then(result => Promise[result instanceof Error ? 'reject' : 'resolve'](result));
+  }
+
+  /**
+   * Send the given command through an authenticated RCON connection
+   * @param  {String} command
+   * @return {Promise} Resolves to response or rejects with an Error object
+   */
+  command (command) {
+    return !this.online || !this.authenticated
+      ? Promise.reject(new Error('Console is not connected and authenticated!'))
+      : this.send(command).then(packets => packets.map(packet => packet.payload).join(''));
+  }
+
   /**
    * Connects and authenticates the RCON instance
-   * @param  {String} server IP from where to find the server
-   * @param  {Number} port Port from where to connect
    * @param  {String} password Password with which to connect
-   * @return {Promise} Resolves if succesful or Rejects an Error if one occured
+   * @param  {Number} [port=25567] Port from where to connect
+   * @param  {String} [host='localhost'] Address from where to find the server
+   * @return {Promise} Resolves if succesful or rejects with an Error object
    */
-  connect (server, port, password) {
-    return new Promise((resolve, reject) => {
-      let data = Buffer.allocUnsafe(0);
-      this.socket = net.connect({ host: server, port: port })
-        .on('data', (chunk) => {
-          data = Buffer.concat([data, chunk]);
-          try {
-            let length = data.readInt32LE(0);
-            while (data.length >= 4 + length) {
-              const response = Packet.read(data.slice(0, 4 + length));
-              this.events.emit('' + response.id, response);
-              data = data.slice(4 + length);
-              length = data.readInt32LE(0);
-            }
-          } catch (error) { /* We don't have enough data yet */ }
-        })
-        .on('drain', () => { this.drain(); })
-        .on('close', () => { this.authenticated = false; this.online = false; })
-        .on('error', error => { throw error; })
-        .setTimeout(this.timeout, () => {
-          this.socket.destroy();
-          reject(new Error(`Socket timed out when connecting to [${server}:${port}]`));
-        })
-        .once('connect', () => {
-          this.online = true;
-          this.socket.setTimeout(0);
-          // Send and process authentication packet
-          this.socket.write(Packet.write(0, Packet.type['AUTH'], password));
-          this.events.on(0, result => {
-            if (result instanceof Error) {
-              reject(result);
-            } else {
-              if (result.type !== Packet.type['AUTH_RES']) {
-                reject(new Error(`Packet is of wrong type! [${result.type}]`));
+  connect (password, port = 25575, host = 'localhost') {
+    return Promise.race([
+      new Promise(resolve => setTimeout(resolve, this.timeout, new Error('Connection timed out!'))),
+      new Promise(resolve => {
+        let data = Buffer.allocUnsafe(0);
+        this.socket = net.connect({ port, host, timeout: this.timeout })
+          .on('close', () => { this.events.emit('close'); this.reset(); })
+          .on('drain', () => { this.drain(); })
+          .once('error', resolve)
+          .once('connect', () => {
+            this.online = true;
+            this.events.emit('connect');
+            // Send and process authentication packet
+            this.send(password, Packet.type.AUTH).then(results => {
+              // Keep event list clean
+              this.socket.off('error', resolve);
+              if (results.pop().id !== -1) {
+                this.authenticated = true;
+                this.events.emit('auth');
+                resolve();
               } else {
-                this.events.removeAllListeners(0);
-                if (result.id === -1) {
-                  reject(new Error(`Authentication failed!`));
-                } else {
-                  this.authenticated = true;
-                  resolve();
-                }
+                resolve(new Error('Authentication failed!'));
               }
+            });
+          })
+          .on('data', chunk => {
+            data = Buffer.concat([data, chunk], data.length + chunk.length);
+            // First 12 bytes are guaranteed to be the packet length, id and type
+            for (let end; (end = data.indexOf(Packet.payload.END, 12)) >= 0;) {
+              const packets = [];
+              for (let start = 0; start < end;) {
+                packets.push(Packet.read(data.slice(start, start += data.readInt32LE(start) + 4)));
+              }
+              this.events.emit(packets.pop().id, packets);
+              // Buffer.byteLength(Packet.payload.END, 'ascii') === 20
+              data = data.slice(end + 20);
             }
           });
-        });
-    });
+      })
+    ]).then(result => Promise[result instanceof Error ? 'reject' : 'resolve'](result));
   }
-  /**
-   * Send the given command through authenticated RCON connection
-   * @param  {String} command
-   * @return {Promise} Resolves to response or Rejects an Error if one occured
-   */
-  send (command) {
-    if (!this.online || !this.authenticated) {
-      return Promise.reject(new Error('The connection needs to be made and authenticated first!'));
-    } else {
-      return new Promise((resolve, reject) => {
-        const id = Packet.id();
-        this.queue.sending.push(Packet.write(id, Packet.type['COMMAND'], command));
-        this.queue.sending.push(Packet.write(id, Packet.type['COMMAND_END'], ''));
-        this.drain();
-        this.events.on(id, result => {
-          if (result instanceof Error) {
-            reject(result);
-          } else {
-            if (result.type !== Packet.type['COMMAND_RES']) {
-              reject(new Error(`Packet is of wrong type! [${result.type}]`));
-            } else {
-              if (result.payload === Packet.payload['COMMAND_END']) {
-                const response = this.queue.pending[result.id].payloads
-                  .reduce((data, chunk) => data + chunk);
-                this.events.removeAllListeners(id);
-                resolve(response);
-              } else {
-                this.queue.pending[result.id].payloads.push(result.payload);
-              }
-            }
-          }
-        });
-      });
-    }
-  }
-};
+}
+
+module.exports = Rcon;
